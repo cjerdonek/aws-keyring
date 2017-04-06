@@ -9,7 +9,8 @@ Options:
   -h --help     Show this screen.
 
 """
-from getpass import getpass 
+from collections import namedtuple
+from getpass import getpass
 import sys
 import time
 import datetime
@@ -22,6 +23,30 @@ import keyring
 
 SESSION_DURATION = 60 * 60
 
+_CredentialInfo = namedtuple('CredentialInfo', ['seconds_left', 'aws_env'])
+
+
+def log(msg):
+    print('aws-keys: {}'.format(msg), file=sys.stderr)
+
+
+def make_aws_env(access_key_id, secret_access_key, session_token=None):
+    aws_env = {
+        'AWS_ACCESS_KEY': access_key_id,
+        'AWS_ACCESS_KEY_ID': access_key_id,
+        'AWS_SECRET_ACCESS_KEY': secret_access_key,
+        'AWS_SECRET_KEY': secret_access_key,
+    }
+    if session_token:
+        aws_env['AWS_SESSION_TOKEN'] = session_token
+
+    return aws_env
+
+
+def make_exports(aws_env):
+    lines = ['export {}={}'.format(*kv) for kv in sorted(aws_env.items())]
+    return '\n'.join(lines)
+
 
 class Credentials(object):
     def __init__(self, name='', access_key_id='', secret_access_key='',
@@ -31,6 +56,13 @@ class Credentials(object):
         self.secret_access_key = secret_access_key
         self.mfa_serial = mfa_serial
         self.temporary_credentials = temporary_credentials
+
+    def are_valid(self):
+        """
+        Return whether the credentials are valid for the given duration.
+        """
+        return (self.temporary_credentials and
+                self.temporary_credentials.time_until_expiration() > 0)
 
 
 class TemporaryCredentials(object):
@@ -43,6 +75,10 @@ class TemporaryCredentials(object):
 
     def time_until_expiration(self):
         return (dateutil.parser.parse(self.expiration) - datetime.datetime.now(pytz.timezone('UTC'))).total_seconds()
+
+    def to_aws_env(self):
+        return make_aws_env(self.temporary_access_key, self.temporary_secret_key,
+                    session_token=self.session_token)
 
     def __str__(self):
         return "%s %s %s %s" % (
@@ -87,7 +123,7 @@ def add(name=None):
     if make_default:
         keyring.set_password('aws-keyring-default', 'default', name)
 
-    print("Credentials added for account name '{}'.".format(name))
+    log("Credentials added for account name '{}'.".format(name))
 
 
 def rm(name):
@@ -99,69 +135,42 @@ def rm(name):
     if credentials.mfa_serial:
         keyring.delete_password('aws-keyring-mfa', name)
 
-    print("Credentials for account name '{}' deleted.".format(name))
+    log("Credentials for account name '{}' deleted.".format(name))
 
 
 def env(name=None):
     credentials = get_credentials(name)
 
-    if (credentials.temporary_credentials and
-        credentials.temporary_credentials.time_until_expiration() > 0):
+    if credentials.are_valid():
         # Unfortunately, we can't just call sync() here and get new credentials
         # if they're expired, because env() is designed to be added directly into
         # the shell environment and so we can't prompt for interactive input for
         # the MFA token. Instead, we tell people to first call sync() and then
         # use env().
-        environment_exports = """
-export AWS_ACCESS_KEY_ID={access_key_id}
-export AWS_ACCESS_KEY={access_key_id}
-export AWS_SECRET_ACCESS_KEY={secret_access_key}
-export AWS_SECRET_KEY={secret_access_key}
-export AWS_SESSION_TOKEN={session_token}
-""".strip().format(
-            access_key_id=credentials.temporary_credentials.temporary_access_key,
-            secret_access_key=credentials.temporary_credentials.temporary_secret_key,
-            session_token=credentials.temporary_credentials.session_token,
-        )
+        aws_env = credentials.temporary_credentials.to_aws_env()
     else:
-        environment_exports = """
-export AWS_ACCESS_KEY_ID={access_key_id}
-export AWS_ACCESS_KEY={access_key_id}
-export AWS_SECRET_ACCESS_KEY={secret_access_key}
-export AWS_SECRET_KEY={secret_access_key}
-""".strip().format(
-            access_key_id=credentials.access_key_id,
-            secret_access_key=credentials.secret_access_key,
-        )
+        aws_env = make_aws_env(credentials.access_key_id, credentials.secret_access_key)
 
+    environment_exports = make_exports(aws_env)
     print(environment_exports)
 
 
-def sync(name=None, from_stdin=False):
-    mfa_TOTP = None
+def update_keyring(name=None, from_stdin=False):
+    import boto
+    from boto.sts import STSConnection
 
-    if not name:
+    if name is None:
         name = get_default_name()
+
+    mfa_TOTP = None
 
     if from_stdin:
         mfa_TOTP = ''.join(sys.stdin.readlines()).strip()
 
-    credentials = get_credentials(name)
-    if not credentials.mfa_serial:
-        # Nothing to do here.
-        return
-
-    # Have temporary credentials and they aren't expired yet, so no need to
-    # get new ones.
-    if (credentials.temporary_credentials and
-        credentials.temporary_credentials.time_until_expiration() > 0):
-        return 
-
-    import boto
-    from boto.sts import STSConnection
-
     if not mfa_TOTP:
         mfa_TOTP = getpass("Enter the MFA code: ")
+
+    credentials = get_credentials(name)
 
     sts_connection = STSConnection(
         aws_access_key_id=credentials.access_key_id,
@@ -182,6 +191,25 @@ def sync(name=None, from_stdin=False):
     )
 
     keyring.set_password('aws-keyring-temporary-credentials', name, str(details))
+
+
+# TODO: allow re-syncing even if the current credentials are still valid
+#  (e.g. if they will expire in a few seconds).
+def sync(name=None, from_stdin=False):
+    if not name:
+        name = get_default_name()
+
+    credentials = get_credentials(name)
+    if not credentials.mfa_serial:
+        # Nothing to do here.
+        return
+
+    # Have temporary credentials and they aren't expired yet, so no need to
+    # get new ones.
+    if credentials.are_valid():
+        return
+
+    update_keyring(name=name, from_stdin=from_stdin)
 
 
 def get_default_name():
@@ -205,7 +233,7 @@ def get_credentials(name=None):
             session_token=session_token,
             expiration=expiration
         )
-   
+
     credentials = Credentials(
         name=name,
         access_key_id=access_key_id,
@@ -214,3 +242,25 @@ def get_credentials(name=None):
         temporary_credentials=temporary_credentials
     )
     return credentials
+
+
+def fetch_aws_env(name=None):
+    """
+    Fetch AWS credentials from the keyring, and return environment variables.
+
+    Returns: (seconds_left, aws_env)
+
+      seconds_left: the remaining number of seconds that the environment
+        variables are valid for.
+      aws_env: a dict of the AWS environment variables, or an empty dict
+        if there are no temporary credentials.
+    """
+    credentials = get_credentials(name)
+    temp_credentials = credentials.temporary_credentials
+    if not temp_credentials:
+        return _CredentialInfo(seconds_left=-1, aws_env={})
+
+    seconds_left = temp_credentials.time_until_expiration()
+    aws_env = temp_credentials.to_aws_env()
+
+    return _CredentialInfo(seconds_left=seconds_left, aws_env=aws_env)
