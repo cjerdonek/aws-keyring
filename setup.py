@@ -20,9 +20,9 @@ setup(
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        'keyring==4.0',
+        'keyring',
         'boto>=2.30',
-        'docopt==0.6.2',
+        'docopt',
         'python-dateutil',
         'pytz',
     ],
