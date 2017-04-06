@@ -4,7 +4,7 @@ Usage:
   aws-keys rm <NAME>
   aws-keys sync [NAME] [--stdin]
   aws-keys env [NAME]
-  aws-keys check-env <SECONDS> [NAME]
+  aws-keys check-env [NAME]
 
 Options:
   -h --help     Show this screen.
@@ -67,12 +67,12 @@ class Credentials(object):
         self.mfa_serial = mfa_serial
         self.temporary_credentials = temporary_credentials
 
-    def are_valid(self, seconds=0):
+    def are_valid(self):
         """
         Return whether the credentials are valid for the given duration.
         """
         return (self.temporary_credentials and
-                self.temporary_credentials.time_until_expiration() > 1.0 * seconds)
+                self.temporary_credentials.time_until_expiration() > 0)
 
 
 class TemporaryCredentials(object):
@@ -104,7 +104,7 @@ def main():
     if arguments['add']:
         add(arguments['<NAME>'])
     if arguments['check-env']:
-        check_env(arguments['<SECONDS>'], arguments['NAME'])
+        check_env(arguments['NAME'])
     elif arguments['rm']:
         rm(arguments['<NAME>'])
     elif arguments['env']:
@@ -167,18 +167,27 @@ def env(name=None):
     print(environment_exports)
 
 
-def check_env(seconds, name=None):
-    seconds = int(seconds)
+def check_env(name=None):
     credentials = get_credentials(name)
-    if not credentials.are_valid(seconds=seconds):
-        log('credentials not valid or will expire < {} seconds'.format(seconds))
+    temp_credentials = credentials.temporary_credentials
+    if not temp_credentials:
+        log('no temporary credentials')
+        sys.exit(1)
+
+    seconds_left = temp_credentials.time_until_expiration()
+    if seconds_left <= 0:
+        log('temporary credentials expired')
         sys.exit(1)
 
     aws_env = get_aws_env()
     if aws_env != credentials.temporary_credentials.to_aws_env():
-        log('environment not up-to-date: need to run exports')
+        log('environment vars not up-to-date: need to run exports')
         sys.exit(1)
 
+    seconds_left = int(seconds_left)
+    log('credentials okay for {} more seconds'.format(seconds_left))
+    # Write the number to stdout so the caller has programmatic access.
+    print(seconds_left)
     sys.exit()
 
 
