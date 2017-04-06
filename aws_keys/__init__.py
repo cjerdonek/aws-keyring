@@ -182,6 +182,7 @@ def check_env(seconds, name=None):
     sys.exit()
 
 
+# TODO: allow syncing e.g. if credentials will expire soon.
 def sync(name=None, from_stdin=False):
     mfa_TOTP = None
 
